@@ -16,6 +16,8 @@
 
 ### Demo Video/GIF
 
+https://github.com/user-attachments/assets/7ab9d79b-e0e9-40c8-8fa0-cce7574b8c2c
+
 ## Overview
 
 A real-time viewer for pretrained [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
