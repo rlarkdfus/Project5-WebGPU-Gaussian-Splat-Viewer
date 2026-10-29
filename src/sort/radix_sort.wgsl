@@ -369,7 +369,20 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
 
             // Note: Each workgroup invocation can proceed independently.
             // Subgroups and workgroups do NOT have to coordinate.
+            // WebGPU has no forward-progress guarantee between workgroups, so an unbounded spin on a
+            // predecessor can hang the GPU (seen on Apple GPUs). Bail out after a fixed number of tries:
+            // the sort may come out wrong for that frame, but the GPU can't lock up.
+            var spins = 0u;
             while true {
+                spins += 1u;
+                if spins > 65536u {
+                    scatter_smem[lid.x] = exc;
+                    if wid.x < nwg.x - 1u {
+                        // publish as a prefix anyway so later workgroups don't wait on us
+                        atomicAdd(&histograms[partition_offset + partition_base], exc | (1u << 30u));
+                    }
+                    break;
+                }
                 //let prev = atomicLoad(&histograms[partition_offset]);// histograms[partition_offset + partition_base_prev];
                 let prev = atomicLoad(&histograms[partition_base_prev + partition_offset]);// histograms[partition_offset + partition_base_prev];
                 if (prev & rs_partition_mask_status) == partition_mask_invalid {

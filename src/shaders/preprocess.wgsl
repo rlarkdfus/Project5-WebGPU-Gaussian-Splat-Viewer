@@ -56,10 +56,24 @@ struct Gaussian {
 };
 
 struct Splat {
-    //TODO: store information for 2D splat rendering
+    pos: u32,                       // NDC center (xy), f16 packed
+    size: u32,                      // NDC half extent of the quad (xy), f16 packed
+    conic_opacity: array<u32,2>,    // conic (xyz) + opacity, f16 packed
+    color: array<u32,2>,            // rgb (+ unused), f16 packed
 };
 
-//TODO: bind your data here
+@group(0) @binding(0)
+var<uniform> camera: CameraUniforms;
+@group(0) @binding(1)
+var<uniform> render_settings: RenderSettings;
+
+@group(1) @binding(0)
+var<storage, read> gaussians : array<Gaussian>;
+@group(1) @binding(1)
+var<storage, read> sh_buffer : array<u32>;
+@group(1) @binding(2)
+var<storage, read_write> splats : array<Splat>;
+
 @group(2) @binding(0)
 var<storage, read_write> sort_infos: SortInfos;
 @group(2) @binding(1)
@@ -71,8 +85,14 @@ var<storage, read_write> sort_dispatch: DispatchIndirect;
 
 /// reads the ith sh coef from the storage buffer 
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
-    //TODO: access your binded sh_coeff, see load.ts for how it is stored
-    return vec3<f32>(0.0);
+    // each point stores 16 coefs x rgb as f16, so 48 halves (24 u32) per point
+    let base = splat_idx * 48u + c_idx * 3u;
+    return vec3<f32>(read_f16(base), read_f16(base + 1u), read_f16(base + 2u));
+}
+
+fn read_f16(half_idx: u32) -> f32 {
+    let pair = unpack2x16float(sh_buffer[half_idx / 2u]);
+    return select(pair.x, pair.y, (half_idx & 1u) == 1u);
 }
 
 // spherical harmonics evaluation with Condon–Shortley phase
@@ -111,8 +131,104 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
 @compute @workgroup_size(workgroupSize,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
-    //TODO: set up pipeline as described in instruction
+    if (idx >= arrayLength(&gaussians)) {
+        return;
+    }
 
-    let keys_per_dispatch = workgroupSize * sortKeyPerThread; 
+    let g = gaussians[idx];
+    let a = unpack2x16float(g.pos_opacity[0]);
+    let b = unpack2x16float(g.pos_opacity[1]);
+    let pos = vec4<f32>(a.x, a.y, b.x, 1.0);
+
+    // view frustum culling, with a slightly enlarged box to keep edge gaussians
+    let view_pos = camera.view * pos;
+    if (view_pos.z < 0.2) {
+        return;
+    }
+    let clip = camera.proj * view_pos;
+    let ndc = clip.xy / clip.w;
+    if (any(abs(ndc) > vec2<f32>(1.2))) {
+        return;
+    }
+
+    // splats that can never reach 1/255 alpha would be discarded by every fragment anyway
+    let opacity = 1.0 / (1.0 + exp(-b.y));
+    if (opacity < 1.0 / 255.0) {
+        return;
+    }
+
+    // 3D covariance: sigma = R S S^T R^T
+    let r01 = unpack2x16float(g.rot[0]);
+    let r23 = unpack2x16float(g.rot[1]);
+    let q = normalize(vec4<f32>(r01.x, r01.y, r23.x, r23.y)); // (w, x, y, z)
+    let qw = q.x; let qx = q.y; let qy = q.z; let qz = q.w;
+    let R = transpose(mat3x3<f32>(
+        1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qw * qz), 2.0 * (qx * qz + qw * qy),
+        2.0 * (qx * qy + qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qw * qx),
+        2.0 * (qx * qz - qw * qy), 2.0 * (qy * qz + qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy),
+    ));
+
+    let s01 = unpack2x16float(g.scale[0]);
+    let s23 = unpack2x16float(g.scale[1]);
+    let scale = exp(vec3<f32>(s01.x, s01.y, s23.x)) * render_settings.gaussian_scaling;
+    let S = mat3x3<f32>(
+        scale.x, 0.0, 0.0,
+        0.0, scale.y, 0.0,
+        0.0, 0.0, scale.z,
+    );
+    let M = R * S;
+    let cov3d = M * transpose(M);
+
+    // 2D covariance: cov2d = J W sigma W^T J^T (EWA splatting)
+    let focal = camera.focal;
+    let tan_fov = 0.5 * camera.viewport / focal;
+    let lim = 1.3 * tan_fov;
+    let tz = view_pos.z;
+    let txy = clamp(view_pos.xy / tz, -lim, lim) * tz;
+
+    let J = mat3x3<f32>(
+        focal.x / tz, 0.0, 0.0,
+        0.0, focal.y / tz, 0.0,
+        -focal.x * txy.x / (tz * tz), -focal.y * txy.y / (tz * tz), 0.0,
+    );
+    let W = mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
+    let T = J * W;
+    let cov2d_full = T * cov3d * transpose(T);
+    // low-pass filter so every splat covers at least ~1 pixel
+    let cov2d = vec3<f32>(cov2d_full[0][0] + 0.3, cov2d_full[0][1], cov2d_full[1][1] + 0.3);
+
+    let det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
+    if (det <= 0.0) {
+        return;
+    }
+    let conic = vec3<f32>(cov2d.z, -cov2d.y, cov2d.x) / det;
+
+    // tight axis-aligned box around the visible part of the ellipse (in pixels), as NDC half extent.
+    // beyond k sigma, opacity * exp(-k^2 / 2) < 1/255 so the fragment shader would discard it;
+    // never go past 3 sigma. a square box from the largest eigenvalue overdraws thin splats badly.
+    let k = min(3.0, sqrt(2.0 * log(255.0 * opacity)));
+    let extent = ceil(k * sqrt(vec2<f32>(cov2d.x, cov2d.z)));
+    let size = 2.0 * extent / camera.viewport;
+
+    let cam_pos = camera.view_inv[3].xyz;
+    let dir = normalize(pos.xyz - cam_pos);
+    let color = computeColorFromSH(dir, idx, u32(render_settings.sh_deg));
+
+    let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
+    splats[store_idx] = Splat(
+        pack2x16float(ndc),
+        pack2x16float(size),
+        array<u32,2>(pack2x16float(conic.xy), pack2x16float(vec2<f32>(conic.z, opacity))),
+        array<u32,2>(pack2x16float(color.rg), pack2x16float(vec2<f32>(color.b, 0.0))),
+    );
+
+    // ascending radix sort: invert the depth bits so the farthest splat sorts first (back to front)
+    sort_depths[store_idx] = ~bitcast<u32>(view_pos.z);
+    sort_indices[store_idx] = store_idx;
+
     // increment DispatchIndirect.dispatchx each time you reach limit for one dispatch of keys
+    let keys_per_dispatch = workgroupSize * sortKeyPerThread;
+    if (store_idx % keys_per_dispatch == 0u) {
+        atomicAdd(&sort_dispatch.dispatch_x, 1u);
+    }
 }
