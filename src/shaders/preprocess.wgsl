@@ -56,10 +56,24 @@ struct Gaussian {
 };
 
 struct Splat {
-    //TODO: store information for 2D splat rendering
+    pos: u32,
+    size: u32,
+    conic_opacity: array<u32,2>,
+    color: array<u32,2>,
 };
 
-//TODO: bind your data here
+@group(0) @binding(0)
+var<uniform> camera: CameraUniforms;
+@group(0) @binding(1)
+var<uniform> render_settings: RenderSettings;
+
+@group(1) @binding(0)
+var<storage, read> gaussians : array<Gaussian>;
+@group(1) @binding(1)
+var<storage, read> sh_buffer : array<u32>;
+@group(1) @binding(2)
+var<storage, read_write> splats : array<Splat>;
+
 @group(2) @binding(0)
 var<storage, read_write> sort_infos: SortInfos;
 @group(2) @binding(1)
@@ -71,8 +85,13 @@ var<storage, read_write> sort_dispatch: DispatchIndirect;
 
 /// reads the ith sh coef from the storage buffer 
 fn sh_coef(splat_idx: u32, c_idx: u32) -> vec3<f32> {
-    //TODO: access your binded sh_coeff, see load.ts for how it is stored
-    return vec3<f32>(0.0);
+    let base = splat_idx * 48u + c_idx * 3u;
+    return vec3<f32>(read_f16(base), read_f16(base + 1u), read_f16(base + 2u));
+}
+
+fn read_f16(half_idx: u32) -> f32 {
+    let pair = unpack2x16float(sh_buffer[half_idx / 2u]);
+    return select(pair.x, pair.y, (half_idx & 1u) == 1u);
 }
 
 // spherical harmonics evaluation with Condon–Shortley phase
@@ -111,8 +130,101 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
 @compute @workgroup_size(workgroupSize,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
-    //TODO: set up pipeline as described in instruction
+    if (idx >= arrayLength(&gaussians)) {
+        return;
+    }
 
-    let keys_per_dispatch = workgroupSize * sortKeyPerThread; 
+    let g = gaussians[idx];
+    let a = unpack2x16float(g.pos_opacity[0]);
+    let b = unpack2x16float(g.pos_opacity[1]);
+    let pos = vec4<f32>(a.x, a.y, b.x, 1.0);
+
+    // Implement view frustum culling to remove non-visible Gaussians (make bounding box to be slightly larger to keep the edge gaussians)
+    let view_pos = camera.view * pos;
+    if (view_pos.z < 0.2) {
+        return;
+    }
+    let clip = camera.proj * view_pos;
+    let ndc = clip.xy / clip.w;
+    if (any(abs(ndc) > vec2<f32>(1.2))) {
+        return;
+    }
+
+    // `opacity`: use sigmoid function to bring back maximum opacity
+    let opacity = 1.0 / (1.0 + exp(-b.y));
+
+    // Compute 3D covariance based on rotation and scale, also user inputted gaussian multipler.
+    let r01 = unpack2x16float(g.rot[0]);
+    let r23 = unpack2x16float(g.rot[1]);
+    let q = normalize(vec4<f32>(r01.x, r01.y, r23.x, r23.y));
+    let qw = q.x; let qx = q.y; let qy = q.z; let qz = q.w;
+    let R = transpose(mat3x3<f32>(
+        1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qw * qz), 2.0 * (qx * qz + qw * qy),
+        2.0 * (qx * qy + qw * qz), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qw * qx),
+        2.0 * (qx * qz - qw * qy), 2.0 * (qy * qz + qw * qx), 1.0 - 2.0 * (qx * qx + qy * qy),
+    ));
+
+    // `scale` (log space): use exponential function to bring back actual scale
+    let s01 = unpack2x16float(g.scale[0]);
+    let s23 = unpack2x16float(g.scale[1]);
+    let scale = exp(vec3<f32>(s01.x, s01.y, s23.x)) * render_settings.gaussian_scaling;
+    let S = mat3x3<f32>(
+        scale.x, 0.0, 0.0,
+        0.0, scale.y, 0.0,
+        0.0, 0.0, scale.z,
+    );
+    let M = R * S;
+    let cov3d = M * transpose(M);
+
+    // Compute 2D conic, maximum radius, and maximum quad size in NDC
+    let focal = camera.focal;
+    let tan_fov = 0.5 * camera.viewport / focal;
+    let lim = 1.3 * tan_fov;
+    let tz = view_pos.z;
+    let txy = clamp(view_pos.xy / tz, -lim, lim) * tz;
+
+    let J = mat3x3<f32>(
+        focal.x / tz, 0.0, 0.0,
+        0.0, focal.y / tz, 0.0,
+        -focal.x * txy.x / (tz * tz), -focal.y * txy.y / (tz * tz), 0.0,
+    );
+    let W = mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
+    let T = J * W;
+    let cov2d_full = T * cov3d * transpose(T);
+    let cov2d = vec3<f32>(cov2d_full[0][0] + 0.3, cov2d_full[0][1], cov2d_full[1][1] + 0.3);
+
+    let det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
+    if (det <= 0.0) {
+        return;
+    }
+    let conic = vec3<f32>(cov2d.z, -cov2d.y, cov2d.x) / det;
+
+    let mid = 0.5 * (cov2d.x + cov2d.z);
+    let lambda1 = mid + sqrt(max(0.1, mid * mid - det));
+    let radius = ceil(3.0 * sqrt(lambda1));
+    let size = 2.0 * vec2<f32>(radius) / camera.viewport;
+
+    // Using spherical harmonics coeffiecients to evaluate the color of the gaussian from particular view direction
+    let cam_pos = camera.view_inv[3].xyz;
+    let dir = normalize(pos.xyz - cam_pos);
+    let color = computeColorFromSH(dir, idx, u32(render_settings.sh_deg));
+
+    // Store essential 2D gaussian data for later rasteriation pipeline
+    let store_idx = atomicAdd(&sort_infos.keys_size, 1u);
+    splats[store_idx] = Splat(
+        pack2x16float(ndc),
+        pack2x16float(size),
+        array<u32,2>(pack2x16float(conic.xy), pack2x16float(vec2<f32>(conic.z, opacity))),
+        array<u32,2>(pack2x16float(color.rg), pack2x16float(vec2<f32>(color.b, 0.0))),
+    );
+
+    // Add key_size, indices, and depth to sorter.
+    sort_depths[store_idx] = ~bitcast<u32>(view_pos.z);
+    sort_indices[store_idx] = store_idx;
+
     // increment DispatchIndirect.dispatchx each time you reach limit for one dispatch of keys
+    let keys_per_dispatch = workgroupSize * sortKeyPerThread;
+    if (store_idx % keys_per_dispatch == 0u) {
+        atomicAdd(&sort_dispatch.dispatch_x, 1u);
+    }
 }
