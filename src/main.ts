@@ -19,6 +19,8 @@ import { assert } from './utils/util';
   }
   
   const device = await adapter.requestDevice({
+    // optional: used for per-pass GPU timing when available
+    requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [],
     requiredLimits: { 
       maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: adapter.limits. maxStorageBufferBindingSize

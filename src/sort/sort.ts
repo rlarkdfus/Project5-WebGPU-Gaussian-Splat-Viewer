@@ -12,7 +12,8 @@ import radix_sort_wgsl from './radix_sort.wgsl';
 import { align } from '../utils/util';
 
 export interface SortStuff {
-  sort: (encoder: GPUCommandEncoder) => void,
+  // optional timestamps: begin is written on the first sort pass, end on the last
+  sort: (encoder: GPUCommandEncoder, timestamps?: { begin?: GPUComputePassTimestampWrites, end?: GPUComputePassTimestampWrites }) => void,
   sort_info_buffer: GPUBuffer,
   sort_dispatch_indirect_buffer: GPUBuffer,
 
@@ -300,10 +301,11 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     ]
   });
 
-  function record_calculate_histogram_indirect(encoder: GPUCommandEncoder) {
+  function record_calculate_histogram_indirect(encoder: GPUCommandEncoder, begin_timestamp?: GPUComputePassTimestampWrites) {
     {
       const pass = encoder.beginComputePass({
         label: 'zeroing histogram',
+        timestampWrites: begin_timestamp,
       });
       pass.setPipeline(pipelines.zero);
       pass.setBindGroup(0, bind_group);
@@ -331,9 +333,10 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     pass.end();
   }
 
-  function record_scatter_keys_indirect(encoder: GPUCommandEncoder) {
+  function record_scatter_keys_indirect(encoder: GPUCommandEncoder, end_timestamp?: GPUComputePassTimestampWrites) {
     const pass = encoder.beginComputePass({
       label: 'scatter keyvals',
+      timestampWrites: end_timestamp,
     });
     pass.setBindGroup(0, bind_group);
 
@@ -350,10 +353,10 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     pass.end();
   }
 
-  function sort(encoder: GPUCommandEncoder) {
-    record_calculate_histogram_indirect(encoder);
+  function sort(encoder: GPUCommandEncoder, timestamps?: { begin?: GPUComputePassTimestampWrites, end?: GPUComputePassTimestampWrites }) {
+    record_calculate_histogram_indirect(encoder, timestamps?.begin);
     record_prefix_histogram(encoder);
-    record_scatter_keys_indirect(encoder);
+    record_scatter_keys_indirect(encoder, timestamps?.end);
   };
 
   return {

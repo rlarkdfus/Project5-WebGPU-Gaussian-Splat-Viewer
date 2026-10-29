@@ -5,10 +5,12 @@ import { default as get_renderer_gaussian, GaussianRenderer } from './gaussian-r
 import { default as get_renderer_pointcloud } from './point-cloud-renderer';
 import { Camera, load_camera_presets} from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
+import { GpuTimer } from '../utils/gpu-timer';
 import { time, timeReturn } from '../utils/simple-console';
+import { create_gpu_timer } from '../utils/gpu-timer';
 
 export interface Renderer {
-  frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => void,
+  frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView, timer?: GpuTimer | null) => void,
   camera_buffer: GPUBuffer,
 }
 
@@ -35,6 +37,9 @@ export default async function init(
     gaussian_renderer.set_num_active(num_points * params.gaussian_percent / 100);
   };
   
+  // null when the device lacks 'timestamp-query'; the GPU timing monitors are hidden then
+  const gpu_timer = create_gpu_timer(device, ['preprocess', 'sort', 'render']);
+
   const camera = new Camera(canvas, device);
   const control = new CameraControl(camera);
 
@@ -75,6 +80,13 @@ export default async function init(
     pane.addMonitor(params, 'fps', {
       readonly:true
     });
+  }
+  if (gpu_timer) {
+    // averaged over the last 30 timed frames; 0 means the pass is not used by the current renderer
+    const folder = pane.addFolder({ title: 'GPU time (ms)' });
+    for (const key of ['preprocess', 'sort', 'render', 'total']) {
+      folder.addMonitor(gpu_timer.results, key, { format: (v: number) => v.toFixed(3) });
+    }
   }
   {
     pane.addInput(params, 'renderer', {
@@ -186,8 +198,10 @@ export default async function init(
       time();
       const encoder = device.createCommandEncoder();
       const texture_view = context.getCurrentTexture().createView();
-      renderer.frame(encoder, texture_view);
+      renderer.frame(encoder, texture_view, gpu_timer);
+      gpu_timer?.resolve(encoder);
       device.queue.submit([encoder.finish()]);
+      gpu_timer?.read();
     }
     requestAnimationFrame(frame);
   }

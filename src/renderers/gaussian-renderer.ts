@@ -3,6 +3,7 @@ import preprocessWGSL from '../shaders/preprocess.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import { get_sorter,c_histogram_block_rows,C } from '../sort/sort';
 import { Renderer } from './renderer';
+import { GpuTimer } from '../utils/gpu-timer';
 
 export interface GaussianRenderer extends Renderer {
   set_gaussian_multiplier: (value: number) => void,
@@ -179,24 +180,25 @@ export default function get_renderer(
   // ===============================================
   //    Command Encoder Functions
   // ===============================================
-  const preprocess = (encoder: GPUCommandEncoder) => {
+  const preprocess = (encoder: GPUCommandEncoder, timer?: GpuTimer | null) => {
     // clear the visible count and sort dispatch size; the preprocess shader rebuilds them
     device.queue.writeBuffer(sorter.sort_info_buffer, 0, nulling_data);
     device.queue.writeBuffer(sorter.sort_dispatch_indirect_buffer, 0, dispatch_reset_data);
 
     const variant = preprocess_variants.get(current_wg_size)!;
-    const pass = encoder.beginComputePass({ label: 'preprocess' });
+    const pass = encoder.beginComputePass({ label: 'preprocess', timestampWrites: timer?.writes('preprocess') });
     pass.setPipeline(variant.pipeline);
     variant.bind_groups.forEach((bind_group, i) => pass.setBindGroup(i, bind_group));
     pass.dispatchWorkgroups(Math.ceil(render_settings_u32[3] / current_wg_size));
     pass.end();
   };
 
-  const render = (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
+  const render = (encoder: GPUCommandEncoder, texture_view: GPUTextureView, timer?: GpuTimer | null) => {
     encoder.copyBufferToBuffer(sorter.sort_info_buffer, 0, indirect_draw_buffer, 4, 4);
 
     const pass = encoder.beginRenderPass({
       label: 'gaussian render',
+      timestampWrites: timer?.writes('render'),
       colorAttachments: [
         {
           view: texture_view,
@@ -216,10 +218,10 @@ export default function get_renderer(
   //    Return Render Object
   // ===============================================
   return {
-    frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
-      preprocess(encoder);
-      sorter.sort(encoder);
-      render(encoder, texture_view);
+    frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView, timer?: GpuTimer | null) => {
+      preprocess(encoder, timer);
+      sorter.sort(encoder, timer ? { begin: timer.writes_begin('sort'), end: timer.writes_end('sort') } : undefined);
+      render(encoder, texture_view, timer);
     },
     set_gaussian_multiplier: (value: number) => {
       render_settings_f32[0] = value;
