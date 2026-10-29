@@ -18,6 +18,7 @@ const SH_C3 = array<f32,7>(
 );
 
 override workgroupSize: u32;
+override sortWorkgroupSize: u32;  // must match the sorter's histogram workgroup size, independent of workgroupSize
 override sortKeyPerThread: u32;
 
 struct DispatchIndirect {
@@ -47,6 +48,8 @@ struct CameraUniforms {
 struct RenderSettings {
     gaussian_scaling: f32,
     sh_deg: f32,
+    frustum_culling: u32,  // 0 = off, 1 = on
+    num_active: u32,       // only the first num_active gaussians are processed
 }
 
 struct Gaussian {
@@ -130,7 +133,7 @@ fn computeColorFromSH(dir: vec3<f32>, v_idx: u32, sh_deg: u32) -> vec3<f32> {
 @compute @workgroup_size(workgroupSize,1,1)
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= arrayLength(&gaussians)) {
+    if (idx >= arrayLength(&gaussians) || idx >= render_settings.num_active) {
         return;
     }
 
@@ -146,7 +149,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     }
     let clip = camera.proj * view_pos;
     let ndc = clip.xy / clip.w;
-    if (any(abs(ndc) > vec2<f32>(1.2))) {
+    if (render_settings.frustum_culling != 0u && any(abs(ndc) > vec2<f32>(1.2))) {
         return;
     }
 
@@ -223,7 +226,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     sort_indices[store_idx] = store_idx;
 
     // increment DispatchIndirect.dispatchx each time you reach limit for one dispatch of keys
-    let keys_per_dispatch = workgroupSize * sortKeyPerThread;
+    let keys_per_dispatch = sortWorkgroupSize * sortKeyPerThread;
     if (store_idx % keys_per_dispatch == 0u) {
         atomicAdd(&sort_dispatch.dispatch_x, 1u);
     }

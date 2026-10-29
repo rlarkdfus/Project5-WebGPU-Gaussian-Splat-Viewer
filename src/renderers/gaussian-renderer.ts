@@ -6,7 +6,14 @@ import { Renderer } from './renderer';
 
 export interface GaussianRenderer extends Renderer {
   set_gaussian_multiplier: (value: number) => void,
+  set_frustum_culling: (enabled: boolean) => void,
+  set_workgroup_size: (size: number) => void,
+  set_num_active: (count: number) => void,
+  workgroup_sizes: number[],
 }
+
+// candidate preprocess workgroup sizes; ones above the device limit are skipped
+const c_preprocess_wg_sizes = [16, 32, 64, 128, 256, 512, 1024];
 
 const c_size_splat = 6 * 4; // must match struct Splat in the shaders
 
@@ -52,59 +59,83 @@ export default function get_renderer(
     new Uint32Array([6, pc.num_points, 0, 0]),
   );
 
-  // RenderSettings: gaussian_scaling, sh_deg
-  const render_settings = new Float32Array([1.0, pc.sh_deg]);
+  // RenderSettings: gaussian_scaling (f32), sh_deg (f32), frustum_culling (u32), num_active (u32)
+  const render_settings = new ArrayBuffer(4 * 4);
+  const render_settings_f32 = new Float32Array(render_settings);
+  const render_settings_u32 = new Uint32Array(render_settings);
+  render_settings_f32[0] = 1.0;
+  render_settings_f32[1] = pc.sh_deg;
+  render_settings_u32[2] = 1;
+  render_settings_u32[3] = pc.num_points;
   const render_settings_buffer = createBuffer(
     device, 'render settings', render_settings.byteLength,
     GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     render_settings,
   );
+  const write_render_settings = () => device.queue.writeBuffer(render_settings_buffer, 0, render_settings);
 
   // ===============================================
   //    Create Compute Pipeline and Bind Groups
   // ===============================================
-  const preprocess_pipeline = device.createComputePipeline({
-    label: 'preprocess',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: preprocessWGSL }),
-      entryPoint: 'preprocess',
-      constants: {
-        workgroupSize: C.histogram_wg_size,
-        sortKeyPerThread: c_histogram_block_rows,
+  // one pipeline per workgroup size, since @workgroup_size is fixed at pipeline creation.
+  // with layout 'auto', bind groups are only compatible with the pipeline they came from.
+  const preprocess_module = device.createShaderModule({ code: preprocessWGSL });
+  const workgroup_sizes = c_preprocess_wg_sizes.filter(
+    (size) => size <= device.limits.maxComputeInvocationsPerWorkgroup
+      && size <= device.limits.maxComputeWorkgroupSizeX,
+  );
+
+  const preprocess_variants = new Map(workgroup_sizes.map((size) => {
+    const pipeline = device.createComputePipeline({
+      label: `preprocess wg${size}`,
+      layout: 'auto',
+      compute: {
+        module: preprocess_module,
+        entryPoint: 'preprocess',
+        constants: {
+          workgroupSize: size,
+          sortWorkgroupSize: C.histogram_wg_size,
+          sortKeyPerThread: c_histogram_block_rows,
+        },
       },
-    },
-  });
+    });
 
-  const camera_bind_group = device.createBindGroup({
-    label: 'preprocess camera',
-    layout: preprocess_pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: camera_buffer } },
-      { binding: 1, resource: { buffer: render_settings_buffer } },
-    ],
-  });
+    const camera_bind_group = device.createBindGroup({
+      label: `preprocess camera wg${size}`,
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: camera_buffer } },
+        { binding: 1, resource: { buffer: render_settings_buffer } },
+      ],
+    });
 
-  const gaussian_bind_group = device.createBindGroup({
-    label: 'preprocess gaussians',
-    layout: preprocess_pipeline.getBindGroupLayout(1),
-    entries: [
-      { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
-      { binding: 1, resource: { buffer: pc.sh_buffer } },
-      { binding: 2, resource: { buffer: splat_buffer } },
-    ],
-  });
+    const gaussian_bind_group = device.createBindGroup({
+      label: `preprocess gaussians wg${size}`,
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+        { binding: 1, resource: { buffer: pc.sh_buffer } },
+        { binding: 2, resource: { buffer: splat_buffer } },
+      ],
+    });
 
-  const sort_bind_group = device.createBindGroup({
-    label: 'sort',
-    layout: preprocess_pipeline.getBindGroupLayout(2),
-    entries: [
-      { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
-      { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
-      { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
-      { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
-    ],
-  });
+    const sort_bind_group = device.createBindGroup({
+      label: `sort wg${size}`,
+      layout: pipeline.getBindGroupLayout(2),
+      entries: [
+        { binding: 0, resource: { buffer: sorter.sort_info_buffer } },
+        { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+        { binding: 2, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
+        { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
+      ],
+    });
+
+    return [size, { pipeline, bind_groups: [camera_bind_group, gaussian_bind_group, sort_bind_group] }];
+  }));
+
+  let current_wg_size = workgroup_sizes.includes(C.histogram_wg_size)
+    ? C.histogram_wg_size
+    : workgroup_sizes[workgroup_sizes.length - 1];
 
 
   // ===============================================
@@ -153,12 +184,11 @@ export default function get_renderer(
     device.queue.writeBuffer(sorter.sort_info_buffer, 0, nulling_data);
     device.queue.writeBuffer(sorter.sort_dispatch_indirect_buffer, 0, dispatch_reset_data);
 
+    const variant = preprocess_variants.get(current_wg_size)!;
     const pass = encoder.beginComputePass({ label: 'preprocess' });
-    pass.setPipeline(preprocess_pipeline);
-    pass.setBindGroup(0, camera_bind_group);
-    pass.setBindGroup(1, gaussian_bind_group);
-    pass.setBindGroup(2, sort_bind_group);
-    pass.dispatchWorkgroups(Math.ceil(pc.num_points / C.histogram_wg_size));
+    pass.setPipeline(variant.pipeline);
+    variant.bind_groups.forEach((bind_group, i) => pass.setBindGroup(i, bind_group));
+    pass.dispatchWorkgroups(Math.ceil(render_settings_u32[3] / current_wg_size));
     pass.end();
   };
 
@@ -192,9 +222,21 @@ export default function get_renderer(
       render(encoder, texture_view);
     },
     set_gaussian_multiplier: (value: number) => {
-      render_settings[0] = value;
-      device.queue.writeBuffer(render_settings_buffer, 0, render_settings);
+      render_settings_f32[0] = value;
+      write_render_settings();
     },
+    set_frustum_culling: (enabled: boolean) => {
+      render_settings_u32[2] = enabled ? 1 : 0;
+      write_render_settings();
+    },
+    set_workgroup_size: (size: number) => {
+      if (preprocess_variants.has(size)) current_wg_size = size;
+    },
+    set_num_active: (count: number) => {
+      render_settings_u32[3] = Math.max(1, Math.min(pc.num_points, Math.floor(count)));
+      write_render_settings();
+    },
+    workgroup_sizes,
     camera_buffer,
   };
 }
